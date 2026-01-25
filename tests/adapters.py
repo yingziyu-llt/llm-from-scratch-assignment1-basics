@@ -6,6 +6,14 @@ from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
+from cs336_basics.model import (Embedding, Linear, MultiHeadAttention, RMSNorm,
+                                RotaryPositionalEmbedding, SiLU, SwiGLU,
+                                TransformerBlock, TransformerLM,
+                                scaled_dot_product_attention, softmax)
+from cs336_basics.optim import AdamW
+from cs336_basics.tokenizer import Tokenizer, train_tokenizer
+from cs336_basics.utlis import (crossEntropy, gradient_clipping,
+                                learning_rate_schedule)
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -28,8 +36,12 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    model = Linear(d_in, d_out)
+    weight_for_model = weights.transpose(0, 1)
+    state_dict = {"weight": weight_for_model}
+    model.load_state_dict(state_dict)
+    model.to(in_features.device)
+    return model(in_features)
 
 
 def run_embedding(
@@ -51,8 +63,12 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
-
+    embedding = Embedding(vocab_size,d_model)
+    weight_for_model = weights
+    state_dict = {"weight": weight_for_model}
+    embedding.load_state_dict(state_dict)
+    embedding.to(token_ids.device)
+    return embedding(token_ids)
 
 def run_swiglu(
     d_model: int,
@@ -76,15 +92,13 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
-
+    model = SwiGLU(d_model, d_ff)
+    # Match Linear class weight shape (in_features, out_features)
+    model.w1.weight.data = w1_weight.T
+    model.w2.weight.data = w2_weight.T
+    model.w3.weight.data = w3_weight.T
+    model.to(in_features.device)
+    return model(in_features)
 
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -104,8 +118,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
-
+    return scaled_dot_product_attention(Q,K,V,mask)
 
 def run_multihead_self_attention(
     d_model: int,
@@ -138,7 +151,13 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = MultiHeadAttention(d_in=in_features.shape[-1], d_k=q_proj_weight.shape[0], d_v=v_proj_weight.shape[0], d_model=d_model, num_heads=num_heads)
+    model.q.weight.data = q_proj_weight.T
+    model.k.weight.data = k_proj_weight.T
+    model.v.weight.data = v_proj_weight.T
+    model.o.weight.data = o_proj_weight.T
+    model.to(in_features.device)
+    return model(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -178,7 +197,13 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = MultiHeadAttention(d_in=in_features.shape[-1], d_k=q_proj_weight.shape[0], d_v=v_proj_weight.shape[0], d_model=d_model, num_heads=num_heads,use_rope=True,theta=theta,max_seq_len=max_seq_len)
+    model.q.weight.data = q_proj_weight.T
+    model.k.weight.data = k_proj_weight.T
+    model.v.weight.data = v_proj_weight.T
+    model.o.weight.data = o_proj_weight.T
+    model.to(in_features.device)
+    return model(in_features)
 
 
 def run_rope(
@@ -200,8 +225,15 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
-
+    rope_module = RotaryPositionalEmbedding(
+        theta=theta, 
+        d_k=d_k, 
+        max_seq_len=max_seq_len, 
+        device=in_query_or_key.device
+    )
+    
+    # Process the input
+    return rope_module(in_query_or_key, token_positions)
 
 def run_transformer_block(
     d_model: int,
@@ -273,7 +305,21 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer_block = TransformerBlock(d_model,d_ff,num_heads,use_rope=True,theta=theta,max_seq_len=max_seq_len)
+    weights_for_model = {
+        "mha.q.weight": weights["attn.q_proj.weight"].T,
+        "mha.k.weight": weights["attn.k_proj.weight"].T,
+        "mha.v.weight": weights["attn.v_proj.weight"].T,
+        "mha.o.weight": weights["attn.output_proj.weight"].T,
+        "rms1.g": weights["ln1.weight"],
+        "ffn.w1.weight": weights["ffn.w1.weight"].T,
+        "ffn.w2.weight": weights["ffn.w2.weight"].T,
+        "ffn.w3.weight": weights["ffn.w3.weight"].T,
+        "rms2.g": weights["ln2.weight"],
+    }
+    transformer_block.load_state_dict(weights_for_model)
+    transformer_block.to(in_features.device)
+    return transformer_block(in_features)
 
 
 def run_transformer_lm(
@@ -355,7 +401,28 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm = TransformerLM(vocab_size,d_model,d_ff,num_heads,num_layers,use_rope=True,theta=rope_theta,max_seq_len=context_length)
+    weights_for_model = {
+        "token_embeddings.weight": weights["token_embeddings.weight"],
+        "ln_final.g": weights["ln_final.weight"],
+        "lm_head.weight": weights["lm_head.weight"].T,
+    }
+    for layer_idx in range(num_layers):
+        prefix = f"layers.{layer_idx}."
+        weights_for_model.update({
+            f"layers.{layer_idx}.mha.q.weight": weights[prefix + "attn.q_proj.weight"].T,
+            f"layers.{layer_idx}.mha.k.weight": weights[prefix + "attn.k_proj.weight"].T,
+            f"layers.{layer_idx}.mha.v.weight": weights[prefix + "attn.v_proj.weight"].T,
+            f"layers.{layer_idx}.mha.o.weight": weights[prefix + "attn.output_proj.weight"].T,
+            f"layers.{layer_idx}.rms1.g": weights[prefix + "ln1.weight"],
+            f"layers.{layer_idx}.ffn.w1.weight": weights[prefix + "ffn.w1.weight"].T,
+            f"layers.{layer_idx}.ffn.w2.weight": weights[prefix + "ffn.w2.weight"].T,
+            f"layers.{layer_idx}.ffn.w3.weight": weights[prefix + "ffn.w3.weight"].T,
+            f"layers.{layer_idx}.rms2.g": weights[prefix + "ln2.weight"],
+        })
+    transformer_lm.load_state_dict(weights_for_model)
+    transformer_lm.to(in_indices.device)
+    return transformer_lm(in_indices)
 
 
 def run_rmsnorm(
@@ -378,8 +445,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
-
+    model = RMSNorm(d_model, eps)
+    model.g.data = weights
+    model.to(in_features.device)
+    return model(in_features)
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
@@ -392,7 +461,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return SiLU()(in_features)
 
 
 def run_get_batch(
@@ -431,7 +500,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
@@ -449,7 +518,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return crossEntropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -461,14 +530,14 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -496,7 +565,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return learning_rate_schedule(it,max_learning_rate,min_learning_rate,warmup_iters,cosine_cycle_iters)
 
 
 def run_save_checkpoint(
@@ -559,7 +628,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab,merges,special_tokens)
 
 
 def run_train_bpe(
@@ -589,4 +658,4 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    return train_tokenizer(input_path, vocab_size, special_tokens)
