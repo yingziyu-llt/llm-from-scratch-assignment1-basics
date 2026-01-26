@@ -1,10 +1,9 @@
+import multiprocessing
 import os
 from collections import Counter, defaultdict
 from typing import BinaryIO
 
 import regex as re
-import torch
-import torch.nn as nn
 
 
 class Tokenizer:
@@ -13,9 +12,11 @@ class Tokenizer:
         self.merges = merges
         self.special_tokens = special_tokens
         self.id2token = vocab
-        self.token2id = {v: k for k,v in self.vocab.items()}
+        self.token2id = {v: k for k, v in self.vocab.items()}
         self.merges_ranks = {pair: i for i, pair in enumerate(merges)}
-        self.pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+        self.pat = re.compile(
+            r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        )
         if self.special_tokens:
             sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
             escaped_specials = [re.escape(s) for s in sorted_specials]
@@ -25,17 +26,17 @@ class Tokenizer:
             self.special_pattern = None
             self.special_tokens_set = set()
         self.cache = {}
-        
+
     def _bpe_encode(self, token_bytes: bytes) -> list[int]:
         if token_bytes in self.cache:
             return self.cache[token_bytes]
-        
+
         word = [bytes([b]) for b in token_bytes]
         while len(word) > 1:
-            min_rank = float('inf')
+            min_rank = float("inf")
             min_pair = None
             for i in range(len(word) - 1):
-                pair = (word[i],word[i + 1])
+                pair = (word[i], word[i + 1])
                 rank = self.merges_ranks.get(pair)
                 if rank is not None and min_rank > rank:
                     min_rank = rank
@@ -45,7 +46,7 @@ class Tokenizer:
             new_word = []
             i = 0
             while i < len(word):
-                if i < len(word) - 1 and (word[i], word[i+1]) == min_pair:
+                if i < len(word) - 1 and (word[i], word[i + 1]) == min_pair:
                     new_word.append(min_pair[0] + min_pair[1])
                     i += 2
                 else:
@@ -55,7 +56,7 @@ class Tokenizer:
         ids = [self.token2id[token] for token in word]
         self.cache[token_bytes] = ids
         return ids
-    
+
     def encode(self, tokens: str):
         ids = []
         if self.special_pattern:
@@ -70,9 +71,9 @@ class Tokenizer:
                 for token_match in self.pat.finditer(chunk):
                     token_bytes = token_match.group().encode("utf-8")
                     ids.extend(self._bpe_encode(token_bytes))
-                    
+
         return ids
-    
+
     def decode(self, ids: list[int]) -> str:
         res_bytes = []
         for i in ids:
@@ -81,10 +82,11 @@ class Tokenizer:
                 res_bytes.append(token)
         combined = b"".join(res_bytes)
         return combined.decode("utf-8", errors="replace")
-    
+
     def encode_iterable(self, iterable):
         for text in iterable:
             yield from self.encode(text)
+
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -95,7 +97,9 @@ def find_chunk_boundaries(
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
     """
-    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
 
     # Get total file size in bytes
     file.seek(0, os.SEEK_END)
@@ -132,63 +136,99 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def train_tokenizer(input_path: str, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # 单线程版
-    with open(input_path, "r", encoding="utf-8") as f:
-        full_data = f.read()
 
-    # 处理 Special Tokens
+def process_chunk(input_path, start_pos, end_pos, special_tokens):
+    """
+    处理文件的一个块，返回该块内的 word_counts。
+    """
+    counts = Counter()
+    # 使用字节模式读取，避免大文件一次性 load 到内存
+    with open(input_path, "rb") as f:
+        f.seek(start_pos)
+        chunk_data = f.read(end_pos - start_pos).decode("utf-8", errors="ignore")
+
+    # 按照作业要求，先根据 special_tokens 分割，确保不跨界合并
     if special_tokens:
         escaped_special = [re.escape(t) for t in special_tokens]
         split_pattern = f"({'|'.join(escaped_special)})"
-        raw_chunks = re.split(split_pattern, full_data)
+        parts = re.split(split_pattern, chunk_data)
     else:
-        raw_chunks = [full_data]
+        parts = [chunk_data]
 
-    # Pre-tokenization
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    
     special_tokens_set = set(special_tokens) if special_tokens else set()
-    word_counts = Counter()
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    for chunk in raw_chunks:
-        if chunk in special_tokens_set or not chunk:
+    for part in parts:
+        if part in special_tokens_set or not part:
             continue
-        pre_tokenized = re.findall(PAT, chunk)
-        for token_str in pre_tokenized:
-            token_bytes = token_str.encode("utf-8")
-            word_counts[token_bytes] += 1
-    
-    word_counts = {tuple(bytes([b]) for b in k): v for k, v in word_counts.items()}
-    
+        # 使用 finditer 比 findall 在某些情况下更省内存 [cite: 7]
+        for match in re.finditer(PAT, part):
+            token_bytes = match.group().encode("utf-8")
+            counts[token_bytes] += 1
+    return counts
+
+
+def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
+    if num_procs is None:
+        num_procs = min(multiprocessing.cpu_count(), 32)
+
+    # 1. 使用你提供的函数寻找块边界
+    # 假设使用第一个 special_token 作为分隔符
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_procs, split_token)
+
+    # 2. 并行执行预分词计数
+    pool = multiprocessing.Pool(processes=num_procs)
+    jobs = []
+    for i in range(len(boundaries) - 1):
+        jobs.append(
+            pool.apply_async(
+                process_chunk,
+                (input_path, boundaries[i], boundaries[i + 1], special_tokens),
+            )
+        )
+
+    pool.close()
+
+    # 3. 合并所有进程的结果
+    final_word_counts = Counter()
+    for job in jobs:
+        final_word_counts.update(job.get())
+    pool.join()
+
+    # 将字节转换成元组格式，准备进行 BPE 合并过程
+    word_counts = {
+        tuple(bytes([b]) for b in k): v for k, v in final_word_counts.items()
+    }
     merges = []
     pair_counts = defaultdict(int)
     pair_pos = defaultdict(set)
-    
+
     for word, count in word_counts.items():
         for i in range(len(word) - 1):
             pair = (word[i], word[i + 1])
             pair_counts[pair] += count
             pair_pos[pair].add(word)
-    
+
     for _ in range(vocab_size - 256 - len(special_tokens)):
         if not pair_counts:
             break
         most_common_pair = max(pair_counts, key=lambda x: (pair_counts[x], x))
         merges.append(most_common_pair)
-        
+
         words_to_update = list(pair_pos[most_common_pair])
-        
+
         for word in words_to_update:
             if word not in word_counts:
                 continue
-                
+
             count = word_counts[word]
-            
+
             for i in range(len(word) - 1):
                 p = (word[i], word[i + 1])
                 pair_counts[p] -= count
-            
+
             new_word_list = []
             i = 0
             while i < len(word):
@@ -199,30 +239,30 @@ def train_tokenizer(input_path: str, vocab_size: int, special_tokens: list[str])
                     new_word_list.append(word[i])
                     i += 1
             new_word = tuple(new_word_list)
-            
+
             for i in range(len(new_word) - 1):
                 p = (new_word[i], new_word[i + 1])
                 pair_counts[p] += count
                 pair_pos[p].add(new_word)
-            
+
             if new_word in word_counts:
                 word_counts[new_word] += count
             else:
                 word_counts[new_word] = count
             del word_counts[word]
-            
+
         del pair_counts[most_common_pair]
         del pair_pos[most_common_pair]
 
     vocab = {i: bytes([i]) for i in range(256)}
-    
+
     # Merges
     for i, merge in enumerate(merges):
         vocab[256 + i] = merge[0] + merge[1]
-    
+
     # Special tokens
     start_special_idx = 256 + len(merges)
     for i, token in enumerate(special_tokens):
         vocab[start_special_idx + i] = token.encode("utf-8")
-        
+
     return vocab, merges
