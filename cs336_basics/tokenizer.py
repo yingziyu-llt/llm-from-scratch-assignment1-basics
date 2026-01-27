@@ -1,8 +1,9 @@
 import multiprocessing
+import heapq
 import os
 from collections import Counter, defaultdict
 from typing import BinaryIO
-
+import pickle
 import regex as re
 
 
@@ -141,11 +142,13 @@ def process_chunk(input_path, start_pos, end_pos, special_tokens):
     """
     处理文件的一个块，返回该块内的 word_counts。
     """
+    print(f"[{time.strftime('%H:%M:%S')}] 开始处理块 {start_pos}-{end_pos}")
     counts = Counter()
     # 使用字节模式读取，避免大文件一次性 load 到内存
     with open(input_path, "rb") as f:
         f.seek(start_pos)
         chunk_data = f.read(end_pos - start_pos).decode("utf-8", errors="ignore")
+    print(f"[{time.strftime('%H:%M:%S')}] 读取完块 {start_pos}-{end_pos}，开始分词...")
 
     # 按照作业要求，先根据 special_tokens 分割，确保不跨界合并
     if special_tokens:
@@ -165,20 +168,45 @@ def process_chunk(input_path, start_pos, end_pos, special_tokens):
         for match in re.finditer(PAT, part):
             token_bytes = match.group().encode("utf-8")
             counts[token_bytes] += 1
-    return counts
+    filename = "chunk_{}_{}.cnt".format(start_pos, end_pos)
+    print(f"[{time.strftime('%H:%M:%S')}] 处理完块 {start_pos}-{end_pos}，生成临时文件 {filename}。")
+    
+    with open(filename, "wb") as f:
+        pickle.dump(counts, f)
+    return filename
 
+class DataBlock:
+    def __init__(self, count, words):
+        self.count = count
+        self.words = words
+    def __lt__(self, other):
+        if self.count == other.count:
+            return self.words > other.words
+        return self.count > other.count
 
+import time  # 新增
 def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
+    # [Log] 记录开始时间
+    start_time = time.time()
+    print(f"[{time.strftime('%H:%M:%S')}] 开始训练 Tokenizer...")
+    
     if num_procs is None:
-        num_procs = min(multiprocessing.cpu_count(), 32)
+        num_procs = min(multiprocessing.cpu_count(), 16) # 降到 16 甚至 8，稳一点
+    
 
-    # 1. 使用你提供的函数寻找块边界
-    # 假设使用第一个 special_token 作为分隔符
+    # 1. 寻找边界
+    print(f"[{time.strftime('%H:%M:%S')}] 正在寻找文件块边界...")
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+    # 关键修改：把文件切成 64 份或者 128 份！
+    # 这样每个块只有原来的 1/4 或 1/8 大小，绝对不会爆内存
+    num_chunks = num_procs * 4 
+    
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_procs, split_token)
-
-    # 2. 并行执行预分词计数
+        boundaries = find_chunk_boundaries(f, num_chunks, split_token)    
+    print(f"[{time.strftime('%H:%M:%S')}] 使用进程数: {num_procs}")
+    print(f"[{time.strftime('%H:%M:%S')}] 找到 {len(boundaries)-1} 个文件块边界。")
+    # 2. 并行执行
+    print(f"[{time.strftime('%H:%M:%S')}] 启动进程池，开始预分词...")
     pool = multiprocessing.Pool(processes=num_procs)
     jobs = []
     for i in range(len(boundaries) - 1):
@@ -188,33 +216,93 @@ def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
                 (input_path, boundaries[i], boundaries[i + 1], special_tokens),
             )
         )
-
     pool.close()
+    
+    print(f"[{time.strftime('%H:%M:%S')}] 所有任务已分发，正在收集结果...")
 
-    # 3. 合并所有进程的结果
+    # 3. 合并结果 (关键卡顿点检测)
     final_word_counts = Counter()
-    for job in jobs:
-        final_word_counts.update(job.get())
-    pool.join()
+    total_jobs = len(jobs)
+    
+    for i, job in enumerate(jobs):
+        try:
+            # 这里接收到的不再是巨大的 Counter，而是一个微小的文件名字符串
+            temp_filename = job.get() 
+            
+            if (i + 1) % 5 == 0:
+                print(f"[{time.strftime('%H:%M:%S')}] 正在合并第 {i+1}/{total_jobs} 个块...")
 
-    # 将字节转换成元组格式，准备进行 BPE 合并过程
+            # 从磁盘加载数据
+            with open(temp_filename, "rb") as f:
+                chunk_counts = pickle.load(f)
+            
+            # 合并
+            final_word_counts.update(chunk_counts)
+            
+            # 及时删除临时文件，清理磁盘空间
+            os.remove(temp_filename)
+            
+            # 显式释放内存
+            del chunk_counts
+            
+        except Exception as e:
+            print(f"[ERROR] 处理任务 {i} 失败: {e}")
+            continue
+    print(f"[{time.strftime('%H:%M:%S')}] 等待进程池关闭...")
+    pool.join()
+    
+    print(f"[{time.strftime('%H:%M:%S')}] 预分词完成。唯一单词数: {len(final_word_counts)}")
+
+    # 准备 BPE
+    print(f"[{time.strftime('%H:%M:%S')}] 正在构建初始统计数据...")
     word_counts = {
         tuple(bytes([b]) for b in k): v for k, v in final_word_counts.items()
     }
+    
+    # 显式释放大对象内存
+    del final_word_counts 
+    import gc
+    gc.collect()
+
     merges = []
     pair_counts = defaultdict(int)
     pair_pos = defaultdict(set)
 
+    print(f"[{time.strftime('%H:%M:%S')}] 正在统计初始 Pair 频率...")
     for word, count in word_counts.items():
         for i in range(len(word) - 1):
             pair = (word[i], word[i + 1])
             pair_counts[pair] += count
             pair_pos[pair].add(word)
+    
+    print(f"[{time.strftime('%H:%M:%S')}] 正在初始化堆 (Heapify)...")
+    heap = [DataBlock(count, pair) for pair, count in pair_counts.items()]
+    heapq.heapify(heap)
 
-    for _ in range(vocab_size - 256 - len(special_tokens)):
-        if not pair_counts:
+    # BPE 循环
+    target_merges = vocab_size - 256 - len(special_tokens)
+    print(f"[{time.strftime('%H:%M:%S')}] 开始 BPE 合并循环 (目标: {target_merges} 次)...")
+    
+    bpe_start_time = time.time()
+    
+    for i in range(target_merges):
+        # 心跳包：每 100 次合并打印一次，证明程序活着
+        if i % 100 == 0:
+            elapsed = time.time() - bpe_start_time
+            rate = (i + 1) / (elapsed + 1e-5)
+            remaining = (target_merges - i) / rate
+            print(f"[{time.strftime('%H:%M:%S')}] Merge {i}/{target_merges} | 速度: {rate:.2f} iter/s | 预计剩余: {remaining/60:.1f} min")
+
+        most_common_pair = None
+        while heap:
+            data_block = heapq.heappop(heap)
+            if pair_counts.get(data_block.words, 0) == data_block.count:
+                most_common_pair = data_block.words
+                break
+        if most_common_pair is None:
+            print(f"[{time.strftime('%H:%M:%S')}] 没有更多 Pair 可合并，提前退出。")
             break
-        most_common_pair = max(pair_counts, key=lambda x: (pair_counts[x], x))
+
         merges.append(most_common_pair)
 
         words_to_update = list(pair_pos[most_common_pair])
@@ -225,25 +313,28 @@ def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
 
             count = word_counts[word]
 
-            for i in range(len(word) - 1):
-                p = (word[i], word[i + 1])
+            for idx in range(len(word) - 1):
+                p = (word[idx], word[idx + 1])
                 pair_counts[p] -= count
+                if pair_counts[p] > 0:
+                    heapq.heappush(heap, DataBlock(pair_counts[p], p))
 
             new_word_list = []
-            i = 0
-            while i < len(word):
-                if i < len(word) - 1 and (word[i], word[i + 1]) == most_common_pair:
+            idx = 0
+            while idx < len(word):
+                if idx < len(word) - 1 and (word[idx], word[idx + 1]) == most_common_pair:
                     new_word_list.append(most_common_pair[0] + most_common_pair[1])
-                    i += 2
+                    idx += 2
                 else:
-                    new_word_list.append(word[i])
-                    i += 1
+                    new_word_list.append(word[idx])
+                    idx += 1
             new_word = tuple(new_word_list)
 
-            for i in range(len(new_word) - 1):
-                p = (new_word[i], new_word[i + 1])
+            for idx in range(len(new_word) - 1):
+                p = (new_word[idx], new_word[idx + 1])
                 pair_counts[p] += count
                 pair_pos[p].add(new_word)
+                heapq.heappush(heap, DataBlock(pair_counts[p], p))
 
             if new_word in word_counts:
                 word_counts[new_word] += count
@@ -254,6 +345,8 @@ def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
         del pair_counts[most_common_pair]
         del pair_pos[most_common_pair]
 
+    print(f"[{time.strftime('%H:%M:%S')}] BPE 循环结束，构建最终词表...")
+    
     vocab = {i: bytes([i]) for i in range(256)}
 
     # Merges
@@ -265,4 +358,5 @@ def train_tokenizer(input_path, vocab_size, special_tokens, num_procs=None):
     for i, token in enumerate(special_tokens):
         vocab[start_special_idx + i] = token.encode("utf-8")
 
+    print(f"[{time.strftime('%H:%M:%S')}] 全部完成。总耗时: {(time.time() - start_time)/60:.2f} 分钟")
     return vocab, merges
